@@ -2,11 +2,16 @@
 
 namespace Illuminate\Broadcasting\Broadcasters;
 
+use ReflectionFunction;
+use ReflectionParameter;
 use Illuminate\Support\Str;
-use Illuminate\Contracts\Broadcasting\Broadcaster;
+use Illuminate\Container\Container;
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Contracts\Routing\BindingRegistrar;
 use Symfony\Component\HttpKernel\Exception\HttpException;
+use Illuminate\Contracts\Broadcasting\Broadcaster as BroadcasterContract;
 
-abstract class Broadcaster implements Broadcaster
+abstract class Broadcaster implements BroadcasterContract
 {
     /**
      * The registered channel authenticators.
@@ -16,9 +21,11 @@ abstract class Broadcaster implements Broadcaster
     protected $channels = [];
 
     /**
-     * {@inheritdoc}
+     * The binding registrar instance.
+     *
+     * @var BindingRegistrar
      */
-    abstract public function broadcast(array $channels, $event, array $payload = []);
+    protected $bindingRegistrar;
 
     /**
      * Register a channel authenticator.
@@ -27,7 +34,7 @@ abstract class Broadcaster implements Broadcaster
      * @param  callable  $callback
      * @return $this
      */
-    public function auth($channel, callable $callback)
+    public function channel($channel, callable $callback)
     {
         $this->channels[$channel] = $callback;
 
@@ -38,18 +45,17 @@ abstract class Broadcaster implements Broadcaster
      * Authenticate the incoming request for a given channel.
      *
      * @param  \Illuminate\Http\Request  $request
+     * @param  string  $channel
      * @return mixed
      */
-    public function check($request)
+    protected function verifyUserCanAccessChannel($request, $channel)
     {
-        $channel = str_replace(['private-', 'presence-'], '', $request->channel_name);
-
         foreach ($this->channels as $pattern => $callback) {
-            if (! Str::is($pattern, $channel)) {
+            if (! Str::is(preg_replace('/\{(.*?)\}/', '*', $pattern), $channel)) {
                 continue;
             }
 
-            $parameters = $this->extractAuthParameters($pattern, $channel);
+            $parameters = $this->extractAuthParameters($pattern, $channel, $callback);
 
             if ($result = $callback($request->user(), ...$parameters)) {
                 return $this->validAuthenticationResponse($request, $result);
@@ -64,41 +70,132 @@ abstract class Broadcaster implements Broadcaster
      *
      * @param  string  $pattern
      * @param  string  $channel
+     * @param  callable  $callback
      * @return array
      */
-    protected function extractAuthParameters($pattern, $channel)
+    protected function extractAuthParameters($pattern, $channel, $callback)
     {
-        if (! Str::contains($pattern, '*')) {
-            return [];
-        }
+        $callbackParameters = (new ReflectionFunction($callback))->getParameters();
 
-        $pattern = str_replace('\*', '([^\.]+)', preg_quote($pattern));
-
-        if (preg_match('/^'.$pattern.'/', $channel, $keys)) {
-            array_shift($keys);
-
-            return $keys;
-        }
-
-        return [];
+        return collect($this->extractChannelKeys($pattern, $channel))->reject(function ($value, $key) {
+            return is_numeric($key);
+        })->map(function ($value, $key) use ($callbackParameters) {
+            return $this->resolveBinding($key, $value, $callbackParameters);
+        })->values()->all();
     }
 
     /**
-     * Return the valid Pusher authentication response.
+     * Extract the channel keys from the incoming channel name.
      *
-     * @param  \Illuminate\Http\Request  $request
-     * @param  mixed  $result
+     * @param  string  $pattern
+     * @param  string  $channel
+     * @return array
+     */
+    protected function extractChannelKeys($pattern, $channel)
+    {
+        preg_match('/^'.preg_replace('/\{(.*?)\}/', '(?<$1>[^\.]+)', $pattern).'/', $channel, $keys);
+
+        return $keys;
+    }
+
+    /**
+     * Resolve the given parameter binding.
+     *
+     * @param  string  $key
+     * @param  string  $value
+     * @param  array  $callbackParameters
      * @return mixed
      */
-    protected function validAuthenticationResponse($request, $result)
+    protected function resolveBinding($key, $value, $callbackParameters)
     {
-        if (is_bool($result)) {
-            return json_encode($result);
+        $newValue = $this->resolveExplicitBindingIfPossible($key, $value);
+
+        return $newValue === $value ? $this->resolveImplicitBindingIfPossible(
+            $key, $value, $callbackParameters
+        ) : $newValue;
+    }
+
+    /**
+     * Resolve an explicit parameter binding if applicable.
+     *
+     * @param  string  $key
+     * @param  mixed  $value
+     * @return mixed
+     */
+    protected function resolveExplicitBindingIfPossible($key, $value)
+    {
+        $binder = $this->binder();
+
+        if ($binder && $binder->getBindingCallback($key)) {
+            return call_user_func($binder->getBindingCallback($key), $value);
         }
 
-        return json_encode(['channel_data' => [
-            'user_id' => $request->user()->getKey(),
-            'user_info' => $result,
-        ]]);
+        return $value;
+    }
+
+    /**
+     * Resolve an implicit parameter binding if applicable.
+     *
+     * @param  string  $key
+     * @param  mixed  $value
+     * @param  array  $callbackParameters
+     * @return mixed
+     */
+    protected function resolveImplicitBindingIfPossible($key, $value, $callbackParameters)
+    {
+        foreach ($callbackParameters as $parameter) {
+            if (! $this->isImplicitlyBindable($key, $parameter)) {
+                continue;
+            }
+
+            $model = $parameter->getClass()->newInstance();
+
+            return $model->where($model->getRouteKeyName(), $value)->firstOr(function () {
+                throw new HttpException(403);
+            });
+        }
+
+        return $value;
+    }
+
+    /**
+     * Determine if a given key and parameter is implicitly bindable.
+     *
+     * @param  string  $key
+     * @param  ReflectionParameter  $parameter
+     * @return bool
+     */
+    protected function isImplicitlyBindable($key, $parameter)
+    {
+        return $parameter->name === $key && $parameter->getClass() &&
+                $parameter->getClass()->isSubclassOf(Model::class);
+    }
+
+    /**
+     * Format the channel array into an array of strings.
+     *
+     * @param  array  $channels
+     * @return array
+     */
+    protected function formatChannels(array $channels)
+    {
+        return array_map(function ($channel) {
+            return (string) $channel;
+        }, $channels);
+    }
+
+    /**
+     * Get the model binding registrar instance.
+     *
+     * @return BindingRegistrar
+     */
+    protected function binder()
+    {
+        if (! $this->bindingRegistrar) {
+            $this->bindingRegistrar = Container::getInstance()->bound(BindingRegistrar::class)
+                        ? Container::getInstance()->make(BindingRegistrar::class) : null;
+        }
+
+        return $this->bindingRegistrar;
     }
 }
